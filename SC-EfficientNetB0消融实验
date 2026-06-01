@@ -1,0 +1,1341 @@
+#1-SDC_CAN_EfficientNetB0--------------------------------------------------------------------------------------------------------------------
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers, callbacks
+from tensorflow.keras.applications import EfficientNetB0
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.python.framework import ops
+from tensorflow.keras.mixed_precision import LossScaleOptimizer
+from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2
+from tensorflow.python.profiler.model_analyzer import profile
+from tensorflow.python.profiler.option_builder import ProfileOptionBuilder
+import time
+import numpy as np
+from sklearn.metrics import precision_score, recall_score, f1_score,confusion_matrix
+import os
+import sys
+import json
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+# 启用混合精度训练
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
+# 设置路径与参数
+train_dir = "/root/.cache/kagglehub/datasets/tomgzg/split-224-dark-bright-blur/versions/1/train"
+val_dir = "/root/.cache/kagglehub/datasets/tomgzg/split-224-dark-bright-blur/versions/1/val"
+test_dir = "/root/.cache/kagglehub/datasets/tomgzg/split-224-dark-bright-blur/versions/1/test"
+input_shape = (224, 224, 3)
+num_classes = 10
+batch_size = 32
+epochs = 40
+
+# 定义自定义模块
+class DynamicChannelAttention(layers.Layer):
+    def __init__(self, reduction_ratio=8):
+        super().__init__()
+        self.reduction_ratio = reduction_ratio
+
+    def build(self, input_shape):
+        self.global_avg_pool = layers.GlobalAveragePooling2D()
+        self.fc1 = layers.Dense(self.reduction_ratio, activation='swish', kernel_regularizer=tf.keras.regularizers.l2(1e-4))
+        self.fc2 = layers.Dense(input_shape[-1], activation='sigmoid', kernel_regularizer=tf.keras.regularizers.l2(1e-4))
+
+    def call(self, inputs):
+        avg_pool = self.global_avg_pool(inputs)
+        attention = self.fc1(avg_pool)
+        attention = self.fc2(attention)
+        attention = layers.Reshape((1, 1, -1))(attention)
+        return inputs * attention
+
+class SeparableDilatedConvBlock(layers.Layer):
+    def __init__(self, filters, dilation_rate):
+        super().__init__()
+        self.conv1 = layers.SeparableConv2D(filters, (3, 3), dilation_rate=dilation_rate, padding='same', activation='swish')
+        self.conv2 = layers.Conv2D(filters, (1, 1), padding='same', activation='swish')
+
+    def call(self, inputs):
+        x = self.conv1(inputs)
+        return self.conv2(x)
+
+class CANBlock(layers.Layer):
+    def __init__(self, reduction_ratio=8):
+        super().__init__()
+        self.reduction_ratio = reduction_ratio
+
+    def build(self, input_shape):
+        self.conv1 = layers.Conv2D(input_shape[-1] // self.reduction_ratio, kernel_size=(3, 3), padding='same', activation='swish')
+        self.conv2 = layers.Conv2D(input_shape[-1], kernel_size=(1, 1), padding='same', activation='sigmoid')
+
+    def call(self, inputs):
+        x = self.conv1(inputs)
+        attention_map = self.conv2(x)
+        return inputs * attention_map
+
+# 构建改进EfficientNetB0模型
+def create_improved_efficientnet(input_shape=(224, 224, 3), num_classes=10, use_dca=True, use_sdc=True, use_can=True):
+    base_model = EfficientNetB0(include_top=False, input_shape=input_shape, weights='imagenet')
+    base_model.trainable = True  # 微调
+    model_input = layers.Input(shape=input_shape)
+    x = base_model(model_input)
+    if use_dca:
+        x = DynamicChannelAttention()(x)
+    if use_sdc:
+        x = SeparableDilatedConvBlock(64, dilation_rate=(2, 2))(x)
+    if use_can:
+        x = CANBlock()(x)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(1024, activation='swish')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.5)(x)
+    output = layers.Dense(num_classes, activation='softmax', dtype='float32')(x)  # 输出层需显式指定为 float32
+    model = models.Model(inputs=model_input, outputs=output)
+    return model
+
+# 消融实验的辅助函数：评估指标
+
+def evaluate_model_limited_time(model, test_generator, model_name, time_limit=2.5):
+    print(f"Evaluating {model_name} under {time_limit}s time constraint...")
+    # 获取测试集的真实标签（整个数据集）
+    y_true_full = test_generator.classes
+    class_names = list(test_generator.class_indices.keys())
+    
+    # 初始化列表，用于存储限定时间内的预测结果和真实标签
+    all_preds = []
+    all_true = []
+    
+    # 记录开始时间
+    start_time = time.time()
+    elapsed_time = 0
+    batch_count = 0
+    total_samples_processed = 0
+    
+    # 在时间限制内循环进行批量推理
+    while elapsed_time < time_limit and batch_count < len(test_generator):
+        # 获取下一批数据
+        x_batch, y_batch = test_generator[batch_count]
+        batch_size_current = x_batch.shape[0]
+        
+        # 进行批量预测
+        pred_probs = model.predict(x_batch, verbose=0)
+        preds = np.argmax(pred_probs, axis=-1)
+        true_labels = np.argmax(y_batch, axis=-1)
+        
+        # 存储预测和真实标签
+        all_preds.extend(preds)
+        all_true.extend(true_labels)
+        
+        total_samples_processed += batch_size_current
+        batch_count += 1
+        elapsed_time = time.time() - start_time
+    
+    # 计算实际使用的推理时间
+    actual_inference_time = elapsed_time
+    if total_samples_processed > 0:
+        avg_inference_time_per_sample = actual_inference_time / total_samples_processed
+    else:
+        avg_inference_time_per_sample = 0
+    
+    # 确保有样本被处理
+    if len(all_true) == 0:
+        print("Warning: No samples were processed within the time limit.")
+        # 返回一个空结果或默认值
+        results = {
+            'model_name': model_name,
+            'accuracy': "0.00%",
+            'precision': "0.00%",
+            'recall': "0.00%",
+            'f1_score': "0.00%",
+            'flops': "0.00G",
+            'params': f"{model.count_params() / 1_000_000:.2f}M",
+            'inference_time': f"＞{time_limit}s",
+            'samples_processed': 0,
+            'inference_speed': "0.0 samples/s"
+        }
+        return pd.DataFrame([results])
+    
+    # 转换为numpy数组
+    all_preds = np.array(all_preds)
+    all_true = np.array(all_true)
+    
+    # 计算评估指标（只基于在限定时间内处理过的样本）
+    accuracy = accuracy_score(all_true, all_preds)
+    precision = precision_score(all_true, all_preds, average='macro', zero_division=0)
+    recall = recall_score(all_true, all_preds, average='macro', zero_division=0)
+    f1 = f1_score(all_true, all_preds, average='macro', zero_division=0)
+    
+    # 绘制混淆矩阵（基于实际处理的样本）
+    cm = confusion_matrix(all_true, all_preds)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted Labels')
+    plt.ylabel('True Labels')
+    plt.xticks(rotation=90)
+    plt.yticks(rotation=0)
+    plt.title(f'Confusion Matrix for {model_name} (Limited Time: {time_limit}s)\nSamples Processed: {total_samples_processed}')
+    plt.show()
+    
+    # 计算FLOPs（保持不变）
+    input_signature = [tf.TensorSpec([1, 224, 224, 3], tf.float32)]
+    graph = tf.function(model).get_concrete_function(*input_signature)
+    opts = ProfileOptionBuilder.float_operation()
+    opts['output'] = 'none'
+    flops = profile(graph.graph, options=opts).total_float_ops
+    flops_g = flops / 1e9
+    
+    # 计算推理速度（样本/秒）
+    inference_speed = total_samples_processed / actual_inference_time if actual_inference_time > 0 else 0
+    
+    # 结果存储
+    results = {
+        'model_name': model_name,
+        'accuracy': f"{accuracy * 100:.2f}%",
+        'precision': f"{precision * 100:.2f}%",
+        'recall': f"{recall * 100:.2f}%",
+        'f1_score': f"{f1 * 100:.2f}%",
+        'flops': f"{flops_g:.2f}G",
+        'params': f"{model.count_params() / 1_000_000:.2f}M",
+        'inference_time': f"{actual_inference_time:.2f}s",
+        'samples_processed': total_samples_processed,
+        'inference_speed': f"{inference_speed:.1f} samples/s"
+    }
+    
+    # 打印简要结果
+    print(f"在 {time_limit}s 内完成了 {total_samples_processed} 个样本的推理")
+    print(f"推理速度: {inference_speed:.1f} samples/s")
+    print(f"准确率: {accuracy * 100:.2f}%")
+    
+    # 创建结果表格
+    results_df = pd.DataFrame([results])
+    return results_df
+
+# 完整测试集评估函数
+def evaluate_model_full(model, test_generator, model_name):
+    print(f"Evaluating {model_name} on full test set...")
+    
+    # 获取真实标签和预测结果
+    y_true = test_generator.classes
+    y_pred_probs = model.predict(test_generator, verbose=1)
+    y_pred = np.argmax(y_pred_probs, axis=1)
+    
+    # 计算评估指标
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    recall = recall_score(y_true, y_pred, average='macro', zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    
+    # 绘制完整混淆矩阵
+    cm = confusion_matrix(y_true, y_pred)
+    class_names = list(test_generator.class_indices.keys())
+    
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted Labels')
+    plt.ylabel('True Labels')
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(rotation=0)
+    plt.title(f'Complete Confusion Matrix for {model_name}\nTotal Samples: {len(y_true)}')
+    plt.tight_layout()
+    plt.show()
+    
+    # 计算FLOPs
+    input_signature = [tf.TensorSpec([1, 224, 224, 3], tf.float32)]
+    graph = tf.function(model).get_concrete_function(*input_signature)
+    opts = ProfileOptionBuilder.float_operation()
+    opts['output'] = 'none'
+    flops = profile(graph.graph, options=opts).total_float_ops
+    flops_g = flops / 1e9
+    
+    # 计算推理时间（整个测试集）
+    start_time = time.time()
+    model.predict(test_generator, verbose=0)
+    total_inference_time = time.time() - start_time
+    avg_inference_time_per_sample = total_inference_time / len(y_true)
+    
+    # 结果存储
+    results = {
+        'model_name': model_name,
+        'accuracy': f"{accuracy * 100:.2f}%",
+        'precision': f"{precision * 100:.2f}%",
+        'recall': f"{recall * 100:.2f}%",
+        'f1_score': f"{f1 * 100:.2f}%",
+        'flops': f"{flops_g:.2f}G",
+        'params': f"{model.count_params() / 1_000_000:.2f}M",
+        'inference_time': f"{avg_inference_time_per_sample:.4f}s/sample",
+        'total_samples': len(y_true),
+        'total_inference_time': f"{total_inference_time:.2f}s"
+    }
+    
+    print(f"完整测试集评估完成: {len(y_true)} 个样本")
+    print(f"平均推理速度: {len(y_true)/total_inference_time:.1f} samples/s")
+    
+    # 创建结果表格
+    results_df = pd.DataFrame([results])
+    return results_df
+
+# 设置消融实验的模型配置
+def create_ablation_models(input_shape=(224, 224, 3), num_classes=10):
+    models_config = {
+        'SDC_CAN_EfficientNetB0': create_improved_efficientnet(input_shape=input_shape, num_classes=num_classes, use_dca=False) 
+    }
+    return models_config
+
+# 数据预处理
+train_datagen = ImageDataGenerator(rescale=1./255)
+val_datagen = ImageDataGenerator(rescale=1./255)
+test_datagen = ImageDataGenerator(rescale=1./255)
+train_generator = train_datagen.flow_from_directory(train_dir, target_size=input_shape[:2], batch_size=batch_size, class_mode='categorical')
+val_generator = val_datagen.flow_from_directory(val_dir, target_size=input_shape[:2], batch_size=batch_size, class_mode='categorical')
+test_generator = test_datagen.flow_from_directory(test_dir, target_size=input_shape[:2], batch_size=batch_size, class_mode='categorical', shuffle=False)
+
+reduce_lr = callbacks.ReduceLROnPlateau(monitor='val_loss', patience=3, factor=0.4, min_lr=1e-6, verbose=1)
+
+# 获取消融实验的模型配置
+models_config = create_ablation_models(input_shape=input_shape, num_classes=10)
+
+# 训练并评估每个模型
+historis = {}
+results = {}
+for model_name, model in models_config.items():
+    print(f"Training model: {model_name}")
+    model.summary()
+    model.compile(optimizer=tf.keras.optimizers.Adam(), 
+                  loss='categorical_crossentropy', 
+                  metrics=['accuracy'])
+    # 训练模型（使用对应的回调）
+    history = model.fit(train_generator, 
+                        epochs=epochs, 
+                        validation_data=val_generator, 
+                        callbacks=[reduce_lr])
+    # 保存训练历史
+    historis[model_name] = history.history
+    # 进行限时评估
+    print("\n=== 限时评估 (2.5s) ===")
+    limited_df = evaluate_model_limited_time(model, test_generator, model_name, time_limit=2.5)
+    results_limited[model_name] = limited_df
+    
+    # 进行完整评估
+    print("\n=== 完整测试集评估 ===")
+    full_df = evaluate_model_full(model, test_generator, model_name)
+    results_full[model_name] = full_df
+
+# 转换为 DataFrame，并展示
+limited_results_df = pd.concat(results_limited.values(), ignore_index=True)
+full_results_df = pd.concat(results_full.values(), ignore_index=True)
+
+print("\n=== 限时评估结果 ===")
+display(limited_results_df)
+
+print("\n=== 完整评估结果 ===")
+display(full_results_df)
+
+
+
+
+
+#2-SDC_EfficientNetB0--------------------------------------------------------------------------------------------------------------------
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers, callbacks
+from tensorflow.keras.applications import EfficientNetB0
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.python.framework import ops
+from tensorflow.keras.mixed_precision import LossScaleOptimizer
+from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2
+from tensorflow.python.profiler.model_analyzer import profile
+from tensorflow.python.profiler.option_builder import ProfileOptionBuilder
+import time
+import numpy as np
+from sklearn.metrics import precision_score, recall_score, f1_score,confusion_matrix
+import os
+import sys
+import json
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+# 启用混合精度训练
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
+# 设置路径与参数
+train_dir = "/root/.cache/kagglehub/datasets/tomgzg/split-224-dark-bright-blur/versions/1/train"
+val_dir = "/root/.cache/kagglehub/datasets/tomgzg/split-224-dark-bright-blur/versions/1/val"
+test_dir = "/root/.cache/kagglehub/datasets/tomgzg/split-224-dark-bright-blur/versions/1/test"
+input_shape = (224, 224, 3)
+num_classes = 10
+batch_size = 32
+epochs = 40
+
+# 定义自定义模块
+class DynamicChannelAttention(layers.Layer):
+    def __init__(self, reduction_ratio=8):
+        super().__init__()
+        self.reduction_ratio = reduction_ratio
+
+    def build(self, input_shape):
+        self.global_avg_pool = layers.GlobalAveragePooling2D()
+        self.fc1 = layers.Dense(self.reduction_ratio, activation='swish', kernel_regularizer=tf.keras.regularizers.l2(1e-4))
+        self.fc2 = layers.Dense(input_shape[-1], activation='sigmoid', kernel_regularizer=tf.keras.regularizers.l2(1e-4))
+
+    def call(self, inputs):
+        avg_pool = self.global_avg_pool(inputs)
+        attention = self.fc1(avg_pool)
+        attention = self.fc2(attention)
+        attention = layers.Reshape((1, 1, -1))(attention)
+        return inputs * attention
+
+class SeparableDilatedConvBlock(layers.Layer):
+    def __init__(self, filters, dilation_rate):
+        super().__init__()
+        self.conv1 = layers.SeparableConv2D(filters, (3, 3), dilation_rate=dilation_rate, padding='same', activation='swish')
+        self.conv2 = layers.Conv2D(filters, (1, 1), padding='same', activation='swish')
+
+    def call(self, inputs):
+        x = self.conv1(inputs)
+        return self.conv2(x)
+
+class CANBlock(layers.Layer):
+    def __init__(self, reduction_ratio=8):
+        super().__init__()
+        self.reduction_ratio = reduction_ratio
+
+    def build(self, input_shape):
+        self.conv1 = layers.Conv2D(input_shape[-1] // self.reduction_ratio, kernel_size=(3, 3), padding='same', activation='swish')
+        self.conv2 = layers.Conv2D(input_shape[-1], kernel_size=(1, 1), padding='same', activation='sigmoid')
+
+    def call(self, inputs):
+        x = self.conv1(inputs)
+        attention_map = self.conv2(x)
+        return inputs * attention_map
+
+# 构建改进EfficientNetB0模型
+def create_improved_efficientnet(input_shape=(224, 224, 3), num_classes=10, use_dca=True, use_sdc=True, use_can=True):
+    base_model = EfficientNetB0(include_top=False, input_shape=input_shape, weights='imagenet')
+    base_model.trainable = True  # 微调
+    model_input = layers.Input(shape=input_shape)
+    x = base_model(model_input)
+    if use_dca:
+        x = DynamicChannelAttention()(x)
+    if use_sdc:
+        x = SeparableDilatedConvBlock(64, dilation_rate=(2, 2))(x)
+    if use_can:
+        x = CANBlock()(x)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(1024, activation='swish')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.5)(x)
+    output = layers.Dense(num_classes, activation='softmax', dtype='float32')(x)  # 输出层需显式指定为 float32
+    model = models.Model(inputs=model_input, outputs=output)
+    return model
+
+# 消融实验的辅助函数：评估指标
+
+def evaluate_model_limited_time(model, test_generator, model_name, time_limit=2.5):
+    print(f"Evaluating {model_name} under {time_limit}s time constraint...")
+    # 获取测试集的真实标签（整个数据集）
+    y_true_full = test_generator.classes
+    class_names = list(test_generator.class_indices.keys())
+    
+    # 初始化列表，用于存储限定时间内的预测结果和真实标签
+    all_preds = []
+    all_true = []
+    
+    # 记录开始时间
+    start_time = time.time()
+    elapsed_time = 0
+    batch_count = 0
+    total_samples_processed = 0
+    
+    # 在时间限制内循环进行批量推理
+    while elapsed_time < time_limit and batch_count < len(test_generator):
+        # 获取下一批数据
+        x_batch, y_batch = test_generator[batch_count]
+        batch_size_current = x_batch.shape[0]
+        
+        # 进行批量预测
+        pred_probs = model.predict(x_batch, verbose=0)
+        preds = np.argmax(pred_probs, axis=-1)
+        true_labels = np.argmax(y_batch, axis=-1)
+        
+        # 存储预测和真实标签
+        all_preds.extend(preds)
+        all_true.extend(true_labels)
+        
+        total_samples_processed += batch_size_current
+        batch_count += 1
+        elapsed_time = time.time() - start_time
+    
+    # 计算实际使用的推理时间
+    actual_inference_time = elapsed_time
+    if total_samples_processed > 0:
+        avg_inference_time_per_sample = actual_inference_time / total_samples_processed
+    else:
+        avg_inference_time_per_sample = 0
+    
+    # 确保有样本被处理
+    if len(all_true) == 0:
+        print("Warning: No samples were processed within the time limit.")
+        # 返回一个空结果或默认值
+        results = {
+            'model_name': model_name,
+            'accuracy': "0.00%",
+            'precision': "0.00%",
+            'recall': "0.00%",
+            'f1_score': "0.00%",
+            'flops': "0.00G",
+            'params': f"{model.count_params() / 1_000_000:.2f}M",
+            'inference_time': f"＞{time_limit}s",
+            'samples_processed': 0,
+            'inference_speed': "0.0 samples/s"
+        }
+        return pd.DataFrame([results])
+    
+    # 转换为numpy数组
+    all_preds = np.array(all_preds)
+    all_true = np.array(all_true)
+    
+    # 计算评估指标（只基于在限定时间内处理过的样本）
+    accuracy = accuracy_score(all_true, all_preds)
+    precision = precision_score(all_true, all_preds, average='macro', zero_division=0)
+    recall = recall_score(all_true, all_preds, average='macro', zero_division=0)
+    f1 = f1_score(all_true, all_preds, average='macro', zero_division=0)
+    
+    # 绘制混淆矩阵（基于实际处理的样本）
+    cm = confusion_matrix(all_true, all_preds)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted Labels')
+    plt.ylabel('True Labels')
+    plt.xticks(rotation=90)
+    plt.yticks(rotation=0)
+    plt.title(f'Confusion Matrix for {model_name} (Limited Time: {time_limit}s)\nSamples Processed: {total_samples_processed}')
+    plt.show()
+    
+    # 计算FLOPs（保持不变）
+    input_signature = [tf.TensorSpec([1, 224, 224, 3], tf.float32)]
+    graph = tf.function(model).get_concrete_function(*input_signature)
+    opts = ProfileOptionBuilder.float_operation()
+    opts['output'] = 'none'
+    flops = profile(graph.graph, options=opts).total_float_ops
+    flops_g = flops / 1e9
+    
+    # 计算推理速度（样本/秒）
+    inference_speed = total_samples_processed / actual_inference_time if actual_inference_time > 0 else 0
+    
+    # 结果存储
+    results = {
+        'model_name': model_name,
+        'accuracy': f"{accuracy * 100:.2f}%",
+        'precision': f"{precision * 100:.2f}%",
+        'recall': f"{recall * 100:.2f}%",
+        'f1_score': f"{f1 * 100:.2f}%",
+        'flops': f"{flops_g:.2f}G",
+        'params': f"{model.count_params() / 1_000_000:.2f}M",
+        'inference_time': f"{actual_inference_time:.2f}s",
+        'samples_processed': total_samples_processed,
+        'inference_speed': f"{inference_speed:.1f} samples/s"
+    }
+    
+    # 打印简要结果
+    print(f"在 {time_limit}s 内完成了 {total_samples_processed} 个样本的推理")
+    print(f"推理速度: {inference_speed:.1f} samples/s")
+    print(f"准确率: {accuracy * 100:.2f}%")
+    
+    # 创建结果表格
+    results_df = pd.DataFrame([results])
+    return results_df
+
+# 完整测试集评估函数
+def evaluate_model_full(model, test_generator, model_name):
+    print(f"Evaluating {model_name} on full test set...")
+    
+    # 获取真实标签和预测结果
+    y_true = test_generator.classes
+    y_pred_probs = model.predict(test_generator, verbose=1)
+    y_pred = np.argmax(y_pred_probs, axis=1)
+    
+    # 计算评估指标
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    recall = recall_score(y_true, y_pred, average='macro', zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    
+    # 绘制完整混淆矩阵
+    cm = confusion_matrix(y_true, y_pred)
+    class_names = list(test_generator.class_indices.keys())
+    
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted Labels')
+    plt.ylabel('True Labels')
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(rotation=0)
+    plt.title(f'Complete Confusion Matrix for {model_name}\nTotal Samples: {len(y_true)}')
+    plt.tight_layout()
+    plt.show()
+    
+    # 计算FLOPs
+    input_signature = [tf.TensorSpec([1, 224, 224, 3], tf.float32)]
+    graph = tf.function(model).get_concrete_function(*input_signature)
+    opts = ProfileOptionBuilder.float_operation()
+    opts['output'] = 'none'
+    flops = profile(graph.graph, options=opts).total_float_ops
+    flops_g = flops / 1e9
+    
+    # 计算推理时间（整个测试集）
+    start_time = time.time()
+    model.predict(test_generator, verbose=0)
+    total_inference_time = time.time() - start_time
+    avg_inference_time_per_sample = total_inference_time / len(y_true)
+    
+    # 结果存储
+    results = {
+        'model_name': model_name,
+        'accuracy': f"{accuracy * 100:.2f}%",
+        'precision': f"{precision * 100:.2f}%",
+        'recall': f"{recall * 100:.2f}%",
+        'f1_score': f"{f1 * 100:.2f}%",
+        'flops': f"{flops_g:.2f}G",
+        'params': f"{model.count_params() / 1_000_000:.2f}M",
+        'inference_time': f"{avg_inference_time_per_sample:.4f}s/sample",
+        'total_samples': len(y_true),
+        'total_inference_time': f"{total_inference_time:.2f}s"
+    }
+    
+    print(f"完整测试集评估完成: {len(y_true)} 个样本")
+    print(f"平均推理速度: {len(y_true)/total_inference_time:.1f} samples/s")
+    
+    # 创建结果表格
+    results_df = pd.DataFrame([results])
+    return results_df
+
+# 设置消融实验的模型配置
+def create_ablation_models(input_shape=(224, 224, 3), num_classes=10):
+    models_config = {
+        'SDC_EfficientNetB0': create_improved_efficientnet(input_shape=input_shape, num_classes=num_classes, use_dca=False,use_can=False)  
+    }
+    return models_config
+
+# 数据预处理
+train_datagen = ImageDataGenerator(rescale=1./255)
+val_datagen = ImageDataGenerator(rescale=1./255)
+test_datagen = ImageDataGenerator(rescale=1./255)
+train_generator = train_datagen.flow_from_directory(train_dir, target_size=input_shape[:2], batch_size=batch_size, class_mode='categorical')
+val_generator = val_datagen.flow_from_directory(val_dir, target_size=input_shape[:2], batch_size=batch_size, class_mode='categorical')
+test_generator = test_datagen.flow_from_directory(test_dir, target_size=input_shape[:2], batch_size=batch_size, class_mode='categorical', shuffle=False)
+
+reduce_lr = callbacks.ReduceLROnPlateau(monitor='val_loss', patience=3, factor=0.4, min_lr=1e-6, verbose=1)
+
+# 获取消融实验的模型配置
+models_config = create_ablation_models(input_shape=input_shape, num_classes=10)
+
+# 训练并评估每个模型
+historis = {}
+results = {}
+for model_name, model in models_config.items():
+    print(f"Training model: {model_name}")
+    model.summary()
+    model.compile(optimizer=tf.keras.optimizers.Adam(), 
+                  loss='categorical_crossentropy', 
+                  metrics=['accuracy'])
+    # 训练模型（使用对应的回调）
+    history = model.fit(train_generator, 
+                        epochs=epochs, 
+                        validation_data=val_generator, 
+                        callbacks=[reduce_lr])
+    # 保存训练历史
+    historis[model_name] = history.history
+    # 进行限时评估
+    print("\n=== 限时评估 (2.5s) ===")
+    limited_df = evaluate_model_limited_time(model, test_generator, model_name, time_limit=2.5)
+    results_limited[model_name] = limited_df
+    
+    # 进行完整评估
+    print("\n=== 完整测试集评估 ===")
+    full_df = evaluate_model_full(model, test_generator, model_name)
+    results_full[model_name] = full_df
+
+# 转换为 DataFrame，并展示
+limited_results_df = pd.concat(results_limited.values(), ignore_index=True)
+full_results_df = pd.concat(results_full.values(), ignore_index=True)
+
+print("\n=== 限时评估结果 ===")
+display(limited_results_df)
+
+print("\n=== 完整评估结果 ===")
+display(full_results_df)
+
+
+
+#3-CAN_EfficientNetB0--------------------------------------------------------------------------------------------------------------------
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers, callbacks
+from tensorflow.keras.applications import EfficientNetB0
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.python.framework import ops
+from tensorflow.keras.mixed_precision import LossScaleOptimizer
+from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2
+from tensorflow.python.profiler.model_analyzer import profile
+from tensorflow.python.profiler.option_builder import ProfileOptionBuilder
+import time
+import numpy as np
+from sklearn.metrics import precision_score, recall_score, f1_score,confusion_matrix
+import os
+import sys
+import json
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+# 启用混合精度训练
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
+# 设置路径与参数
+train_dir = "/root/.cache/kagglehub/datasets/tomgzg/split-224-dark-bright-blur/versions/1/train"
+val_dir = "/root/.cache/kagglehub/datasets/tomgzg/split-224-dark-bright-blur/versions/1/val"
+test_dir = "/root/.cache/kagglehub/datasets/tomgzg/split-224-dark-bright-blur/versions/1/test"
+input_shape = (224, 224, 3)
+num_classes = 10
+batch_size = 32
+epochs = 40
+
+# 定义自定义模块
+class DynamicChannelAttention(layers.Layer):
+    def __init__(self, reduction_ratio=8):
+        super().__init__()
+        self.reduction_ratio = reduction_ratio
+
+    def build(self, input_shape):
+        self.global_avg_pool = layers.GlobalAveragePooling2D()
+        self.fc1 = layers.Dense(self.reduction_ratio, activation='swish', kernel_regularizer=tf.keras.regularizers.l2(1e-4))
+        self.fc2 = layers.Dense(input_shape[-1], activation='sigmoid', kernel_regularizer=tf.keras.regularizers.l2(1e-4))
+
+    def call(self, inputs):
+        avg_pool = self.global_avg_pool(inputs)
+        attention = self.fc1(avg_pool)
+        attention = self.fc2(attention)
+        attention = layers.Reshape((1, 1, -1))(attention)
+        return inputs * attention
+
+class SeparableDilatedConvBlock(layers.Layer):
+    def __init__(self, filters, dilation_rate):
+        super().__init__()
+        self.conv1 = layers.SeparableConv2D(filters, (3, 3), dilation_rate=dilation_rate, padding='same', activation='swish')
+        self.conv2 = layers.Conv2D(filters, (1, 1), padding='same', activation='swish')
+
+    def call(self, inputs):
+        x = self.conv1(inputs)
+        return self.conv2(x)
+
+class CANBlock(layers.Layer):
+    def __init__(self, reduction_ratio=8):
+        super().__init__()
+        self.reduction_ratio = reduction_ratio
+
+    def build(self, input_shape):
+        self.conv1 = layers.Conv2D(input_shape[-1] // self.reduction_ratio, kernel_size=(3, 3), padding='same', activation='swish')
+        self.conv2 = layers.Conv2D(input_shape[-1], kernel_size=(1, 1), padding='same', activation='sigmoid')
+
+    def call(self, inputs):
+        x = self.conv1(inputs)
+        attention_map = self.conv2(x)
+        return inputs * attention_map
+
+# 构建改进EfficientNetB0模型
+def create_improved_efficientnet(input_shape=(224, 224, 3), num_classes=10, use_dca=True, use_sdc=True, use_can=True):
+    base_model = EfficientNetB0(include_top=False, input_shape=input_shape, weights='imagenet')
+    base_model.trainable = True  # 微调
+    model_input = layers.Input(shape=input_shape)
+    x = base_model(model_input)
+    if use_dca:
+        x = DynamicChannelAttention()(x)
+    if use_sdc:
+        x = SeparableDilatedConvBlock(64, dilation_rate=(2, 2))(x)
+    if use_can:
+        x = CANBlock()(x)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(1024, activation='swish')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.5)(x)
+    output = layers.Dense(num_classes, activation='softmax', dtype='float32')(x)  # 输出层需显式指定为 float32
+    model = models.Model(inputs=model_input, outputs=output)
+    return model
+
+# 消融实验的辅助函数：评估指标
+
+def evaluate_model_limited_time(model, test_generator, model_name, time_limit=2.5):
+    print(f"Evaluating {model_name} under {time_limit}s time constraint...")
+    # 获取测试集的真实标签（整个数据集）
+    y_true_full = test_generator.classes
+    class_names = list(test_generator.class_indices.keys())
+    
+    # 初始化列表，用于存储限定时间内的预测结果和真实标签
+    all_preds = []
+    all_true = []
+    
+    # 记录开始时间
+    start_time = time.time()
+    elapsed_time = 0
+    batch_count = 0
+    total_samples_processed = 0
+    
+    # 在时间限制内循环进行批量推理
+    while elapsed_time < time_limit and batch_count < len(test_generator):
+        # 获取下一批数据
+        x_batch, y_batch = test_generator[batch_count]
+        batch_size_current = x_batch.shape[0]
+        
+        # 进行批量预测
+        pred_probs = model.predict(x_batch, verbose=0)
+        preds = np.argmax(pred_probs, axis=-1)
+        true_labels = np.argmax(y_batch, axis=-1)
+        
+        # 存储预测和真实标签
+        all_preds.extend(preds)
+        all_true.extend(true_labels)
+        
+        total_samples_processed += batch_size_current
+        batch_count += 1
+        elapsed_time = time.time() - start_time
+    
+    # 计算实际使用的推理时间
+    actual_inference_time = elapsed_time
+    if total_samples_processed > 0:
+        avg_inference_time_per_sample = actual_inference_time / total_samples_processed
+    else:
+        avg_inference_time_per_sample = 0
+    
+    # 确保有样本被处理
+    if len(all_true) == 0:
+        print("Warning: No samples were processed within the time limit.")
+        # 返回一个空结果或默认值
+        results = {
+            'model_name': model_name,
+            'accuracy': "0.00%",
+            'precision': "0.00%",
+            'recall': "0.00%",
+            'f1_score': "0.00%",
+            'flops': "0.00G",
+            'params': f"{model.count_params() / 1_000_000:.2f}M",
+            'inference_time': f"＞{time_limit}s",
+            'samples_processed': 0,
+            'inference_speed': "0.0 samples/s"
+        }
+        return pd.DataFrame([results])
+    
+    # 转换为numpy数组
+    all_preds = np.array(all_preds)
+    all_true = np.array(all_true)
+    
+    # 计算评估指标（只基于在限定时间内处理过的样本）
+    accuracy = accuracy_score(all_true, all_preds)
+    precision = precision_score(all_true, all_preds, average='macro', zero_division=0)
+    recall = recall_score(all_true, all_preds, average='macro', zero_division=0)
+    f1 = f1_score(all_true, all_preds, average='macro', zero_division=0)
+    
+    # 绘制混淆矩阵（基于实际处理的样本）
+    cm = confusion_matrix(all_true, all_preds)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted Labels')
+    plt.ylabel('True Labels')
+    plt.xticks(rotation=90)
+    plt.yticks(rotation=0)
+    plt.title(f'Confusion Matrix for {model_name} (Limited Time: {time_limit}s)\nSamples Processed: {total_samples_processed}')
+    plt.show()
+    
+    # 计算FLOPs（保持不变）
+    input_signature = [tf.TensorSpec([1, 224, 224, 3], tf.float32)]
+    graph = tf.function(model).get_concrete_function(*input_signature)
+    opts = ProfileOptionBuilder.float_operation()
+    opts['output'] = 'none'
+    flops = profile(graph.graph, options=opts).total_float_ops
+    flops_g = flops / 1e9
+    
+    # 计算推理速度（样本/秒）
+    inference_speed = total_samples_processed / actual_inference_time if actual_inference_time > 0 else 0
+    
+    # 结果存储
+    results = {
+        'model_name': model_name,
+        'accuracy': f"{accuracy * 100:.2f}%",
+        'precision': f"{precision * 100:.2f}%",
+        'recall': f"{recall * 100:.2f}%",
+        'f1_score': f"{f1 * 100:.2f}%",
+        'flops': f"{flops_g:.2f}G",
+        'params': f"{model.count_params() / 1_000_000:.2f}M",
+        'inference_time': f"{actual_inference_time:.2f}s",
+        'samples_processed': total_samples_processed,
+        'inference_speed': f"{inference_speed:.1f} samples/s"
+    }
+    
+    # 打印简要结果
+    print(f"在 {time_limit}s 内完成了 {total_samples_processed} 个样本的推理")
+    print(f"推理速度: {inference_speed:.1f} samples/s")
+    print(f"准确率: {accuracy * 100:.2f}%")
+    
+    # 创建结果表格
+    results_df = pd.DataFrame([results])
+    return results_df
+
+# 完整测试集评估函数
+def evaluate_model_full(model, test_generator, model_name):
+    print(f"Evaluating {model_name} on full test set...")
+    
+    # 获取真实标签和预测结果
+    y_true = test_generator.classes
+    y_pred_probs = model.predict(test_generator, verbose=1)
+    y_pred = np.argmax(y_pred_probs, axis=1)
+    
+    # 计算评估指标
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    recall = recall_score(y_true, y_pred, average='macro', zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    
+    # 绘制完整混淆矩阵
+    cm = confusion_matrix(y_true, y_pred)
+    class_names = list(test_generator.class_indices.keys())
+    
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted Labels')
+    plt.ylabel('True Labels')
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(rotation=0)
+    plt.title(f'Complete Confusion Matrix for {model_name}\nTotal Samples: {len(y_true)}')
+    plt.tight_layout()
+    plt.show()
+    
+    # 计算FLOPs
+    input_signature = [tf.TensorSpec([1, 224, 224, 3], tf.float32)]
+    graph = tf.function(model).get_concrete_function(*input_signature)
+    opts = ProfileOptionBuilder.float_operation()
+    opts['output'] = 'none'
+    flops = profile(graph.graph, options=opts).total_float_ops
+    flops_g = flops / 1e9
+    
+    # 计算推理时间（整个测试集）
+    start_time = time.time()
+    model.predict(test_generator, verbose=0)
+    total_inference_time = time.time() - start_time
+    avg_inference_time_per_sample = total_inference_time / len(y_true)
+    
+    # 结果存储
+    results = {
+        'model_name': model_name,
+        'accuracy': f"{accuracy * 100:.2f}%",
+        'precision': f"{precision * 100:.2f}%",
+        'recall': f"{recall * 100:.2f}%",
+        'f1_score': f"{f1 * 100:.2f}%",
+        'flops': f"{flops_g:.2f}G",
+        'params': f"{model.count_params() / 1_000_000:.2f}M",
+        'inference_time': f"{avg_inference_time_per_sample:.4f}s/sample",
+        'total_samples': len(y_true),
+        'total_inference_time': f"{total_inference_time:.2f}s"
+    }
+    
+    print(f"完整测试集评估完成: {len(y_true)} 个样本")
+    print(f"平均推理速度: {len(y_true)/total_inference_time:.1f} samples/s")
+    
+    # 创建结果表格
+    results_df = pd.DataFrame([results])
+    return results_df
+
+# 设置消融实验的模型配置
+def create_ablation_models(input_shape=(224, 224, 3), num_classes=10):
+    models_config = {
+        'CAN_EfficientNetB0': create_improved_efficientnet(input_shape=input_shape, num_classes=num_classes, use_dca=False,use_sdc=False) 
+    }
+    return models_config
+
+# 数据预处理
+train_datagen = ImageDataGenerator(rescale=1./255)
+val_datagen = ImageDataGenerator(rescale=1./255)
+test_datagen = ImageDataGenerator(rescale=1./255)
+train_generator = train_datagen.flow_from_directory(train_dir, target_size=input_shape[:2], batch_size=batch_size, class_mode='categorical')
+val_generator = val_datagen.flow_from_directory(val_dir, target_size=input_shape[:2], batch_size=batch_size, class_mode='categorical')
+test_generator = test_datagen.flow_from_directory(test_dir, target_size=input_shape[:2], batch_size=batch_size, class_mode='categorical', shuffle=False)
+
+reduce_lr = callbacks.ReduceLROnPlateau(monitor='val_loss', patience=3, factor=0.4, min_lr=1e-6, verbose=1)
+
+# 获取消融实验的模型配置
+models_config = create_ablation_models(input_shape=input_shape, num_classes=10)
+
+# 训练并评估每个模型
+historis = {}
+results = {}
+for model_name, model in models_config.items():
+    print(f"Training model: {model_name}")
+    model.summary()
+    model.compile(optimizer=tf.keras.optimizers.Adam(), 
+                  loss='categorical_crossentropy', 
+                  metrics=['accuracy'])
+    # 训练模型（使用对应的回调）
+    history = model.fit(train_generator, 
+                        epochs=epochs, 
+                        validation_data=val_generator, 
+                        callbacks=[reduce_lr])
+    # 保存训练历史
+    historis[model_name] = history.history
+    # 进行限时评估
+    print("\n=== 限时评估 (2.5s) ===")
+    limited_df = evaluate_model_limited_time(model, test_generator, model_name, time_limit=2.5)
+    results_limited[model_name] = limited_df
+    
+    # 进行完整评估
+    print("\n=== 完整测试集评估 ===")
+    full_df = evaluate_model_full(model, test_generator, model_name)
+    results_full[model_name] = full_df
+
+# 转换为 DataFrame，并展示
+limited_results_df = pd.concat(results_limited.values(), ignore_index=True)
+full_results_df = pd.concat(results_full.values(), ignore_index=True)
+
+print("\n=== 限时评估结果 ===")
+display(limited_results_df)
+
+print("\n=== 完整评估结果 ===")
+display(full_results_df)
+
+
+
+
+
+#4-EfficientNetB0--------------------------------------------------------------------------------------------------------------------
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers, callbacks
+from tensorflow.keras.applications import EfficientNetB0
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.python.framework import ops
+from tensorflow.keras.mixed_precision import LossScaleOptimizer
+from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2
+from tensorflow.python.profiler.model_analyzer import profile
+from tensorflow.python.profiler.option_builder import ProfileOptionBuilder
+import time
+import numpy as np
+from sklearn.metrics import precision_score, recall_score, f1_score,confusion_matrix
+import os
+import sys
+import json
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+# 启用混合精度训练
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
+# 设置路径与参数
+train_dir = "/root/.cache/kagglehub/datasets/tomgzg/split-224-dark-bright-blur/versions/1/train"
+val_dir = "/root/.cache/kagglehub/datasets/tomgzg/split-224-dark-bright-blur/versions/1/val"
+test_dir = "/root/.cache/kagglehub/datasets/tomgzg/split-224-dark-bright-blur/versions/1/test"
+input_shape = (224, 224, 3)
+num_classes = 10
+batch_size = 32
+epochs = 40
+
+# 定义自定义模块
+class DynamicChannelAttention(layers.Layer):
+    def __init__(self, reduction_ratio=8):
+        super().__init__()
+        self.reduction_ratio = reduction_ratio
+
+    def build(self, input_shape):
+        self.global_avg_pool = layers.GlobalAveragePooling2D()
+        self.fc1 = layers.Dense(self.reduction_ratio, activation='swish', kernel_regularizer=tf.keras.regularizers.l2(1e-4))
+        self.fc2 = layers.Dense(input_shape[-1], activation='sigmoid', kernel_regularizer=tf.keras.regularizers.l2(1e-4))
+
+    def call(self, inputs):
+        avg_pool = self.global_avg_pool(inputs)
+        attention = self.fc1(avg_pool)
+        attention = self.fc2(attention)
+        attention = layers.Reshape((1, 1, -1))(attention)
+        return inputs * attention
+
+class SeparableDilatedConvBlock(layers.Layer):
+    def __init__(self, filters, dilation_rate):
+        super().__init__()
+        self.conv1 = layers.SeparableConv2D(filters, (3, 3), dilation_rate=dilation_rate, padding='same', activation='swish')
+        self.conv2 = layers.Conv2D(filters, (1, 1), padding='same', activation='swish')
+
+    def call(self, inputs):
+        x = self.conv1(inputs)
+        return self.conv2(x)
+
+class CANBlock(layers.Layer):
+    def __init__(self, reduction_ratio=8):
+        super().__init__()
+        self.reduction_ratio = reduction_ratio
+
+    def build(self, input_shape):
+        self.conv1 = layers.Conv2D(input_shape[-1] // self.reduction_ratio, kernel_size=(3, 3), padding='same', activation='swish')
+        self.conv2 = layers.Conv2D(input_shape[-1], kernel_size=(1, 1), padding='same', activation='sigmoid')
+
+    def call(self, inputs):
+        x = self.conv1(inputs)
+        attention_map = self.conv2(x)
+        return inputs * attention_map
+
+# 构建改进EfficientNetB0模型
+def create_improved_efficientnet(input_shape=(224, 224, 3), num_classes=10, use_dca=True, use_sdc=True, use_can=True):
+    base_model = EfficientNetB0(include_top=False, input_shape=input_shape, weights='imagenet')
+    base_model.trainable = True  # 微调
+    model_input = layers.Input(shape=input_shape)
+    x = base_model(model_input)
+    if use_dca:
+        x = DynamicChannelAttention()(x)
+    if use_sdc:
+        x = SeparableDilatedConvBlock(64, dilation_rate=(2, 2))(x)
+    if use_can:
+        x = CANBlock()(x)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(1024, activation='swish')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.5)(x)
+    output = layers.Dense(num_classes, activation='softmax', dtype='float32')(x)  # 输出层需显式指定为 float32
+    model = models.Model(inputs=model_input, outputs=output)
+    return model
+
+# 消融实验的辅助函数：评估指标
+
+def evaluate_model_limited_time(model, test_generator, model_name, time_limit=2.5):
+    print(f"Evaluating {model_name} under {time_limit}s time constraint...")
+    # 获取测试集的真实标签（整个数据集）
+    y_true_full = test_generator.classes
+    class_names = list(test_generator.class_indices.keys())
+    
+    # 初始化列表，用于存储限定时间内的预测结果和真实标签
+    all_preds = []
+    all_true = []
+    
+    # 记录开始时间
+    start_time = time.time()
+    elapsed_time = 0
+    batch_count = 0
+    total_samples_processed = 0
+    
+    # 在时间限制内循环进行批量推理
+    while elapsed_time < time_limit and batch_count < len(test_generator):
+        # 获取下一批数据
+        x_batch, y_batch = test_generator[batch_count]
+        batch_size_current = x_batch.shape[0]
+        
+        # 进行批量预测
+        pred_probs = model.predict(x_batch, verbose=0)
+        preds = np.argmax(pred_probs, axis=-1)
+        true_labels = np.argmax(y_batch, axis=-1)
+        
+        # 存储预测和真实标签
+        all_preds.extend(preds)
+        all_true.extend(true_labels)
+        
+        total_samples_processed += batch_size_current
+        batch_count += 1
+        elapsed_time = time.time() - start_time
+    
+    # 计算实际使用的推理时间
+    actual_inference_time = elapsed_time
+    if total_samples_processed > 0:
+        avg_inference_time_per_sample = actual_inference_time / total_samples_processed
+    else:
+        avg_inference_time_per_sample = 0
+    
+    # 确保有样本被处理
+    if len(all_true) == 0:
+        print("Warning: No samples were processed within the time limit.")
+        # 返回一个空结果或默认值
+        results = {
+            'model_name': model_name,
+            'accuracy': "0.00%",
+            'precision': "0.00%",
+            'recall': "0.00%",
+            'f1_score': "0.00%",
+            'flops': "0.00G",
+            'params': f"{model.count_params() / 1_000_000:.2f}M",
+            'inference_time': f"＞{time_limit}s",
+            'samples_processed': 0,
+            'inference_speed': "0.0 samples/s"
+        }
+        return pd.DataFrame([results])
+    
+    # 转换为numpy数组
+    all_preds = np.array(all_preds)
+    all_true = np.array(all_true)
+    
+    # 计算评估指标（只基于在限定时间内处理过的样本）
+    accuracy = accuracy_score(all_true, all_preds)
+    precision = precision_score(all_true, all_preds, average='macro', zero_division=0)
+    recall = recall_score(all_true, all_preds, average='macro', zero_division=0)
+    f1 = f1_score(all_true, all_preds, average='macro', zero_division=0)
+    
+    # 绘制混淆矩阵（基于实际处理的样本）
+    cm = confusion_matrix(all_true, all_preds)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted Labels')
+    plt.ylabel('True Labels')
+    plt.xticks(rotation=90)
+    plt.yticks(rotation=0)
+    plt.title(f'Confusion Matrix for {model_name} (Limited Time: {time_limit}s)\nSamples Processed: {total_samples_processed}')
+    plt.show()
+    
+    # 计算FLOPs（保持不变）
+    input_signature = [tf.TensorSpec([1, 224, 224, 3], tf.float32)]
+    graph = tf.function(model).get_concrete_function(*input_signature)
+    opts = ProfileOptionBuilder.float_operation()
+    opts['output'] = 'none'
+    flops = profile(graph.graph, options=opts).total_float_ops
+    flops_g = flops / 1e9
+    
+    # 计算推理速度（样本/秒）
+    inference_speed = total_samples_processed / actual_inference_time if actual_inference_time > 0 else 0
+    
+    # 结果存储
+    results = {
+        'model_name': model_name,
+        'accuracy': f"{accuracy * 100:.2f}%",
+        'precision': f"{precision * 100:.2f}%",
+        'recall': f"{recall * 100:.2f}%",
+        'f1_score': f"{f1 * 100:.2f}%",
+        'flops': f"{flops_g:.2f}G",
+        'params': f"{model.count_params() / 1_000_000:.2f}M",
+        'inference_time': f"{actual_inference_time:.2f}s",
+        'samples_processed': total_samples_processed,
+        'inference_speed': f"{inference_speed:.1f} samples/s"
+    }
+    
+    # 打印简要结果
+    print(f"在 {time_limit}s 内完成了 {total_samples_processed} 个样本的推理")
+    print(f"推理速度: {inference_speed:.1f} samples/s")
+    print(f"准确率: {accuracy * 100:.2f}%")
+    
+    # 创建结果表格
+    results_df = pd.DataFrame([results])
+    return results_df
+
+# 完整测试集评估函数
+def evaluate_model_full(model, test_generator, model_name):
+    print(f"Evaluating {model_name} on full test set...")
+    
+    # 获取真实标签和预测结果
+    y_true = test_generator.classes
+    y_pred_probs = model.predict(test_generator, verbose=1)
+    y_pred = np.argmax(y_pred_probs, axis=1)
+    
+    # 计算评估指标
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    recall = recall_score(y_true, y_pred, average='macro', zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    
+    # 绘制完整混淆矩阵
+    cm = confusion_matrix(y_true, y_pred)
+    class_names = list(test_generator.class_indices.keys())
+    
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted Labels')
+    plt.ylabel('True Labels')
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(rotation=0)
+    plt.title(f'Complete Confusion Matrix for {model_name}\nTotal Samples: {len(y_true)}')
+    plt.tight_layout()
+    plt.show()
+    
+    # 计算FLOPs
+    input_signature = [tf.TensorSpec([1, 224, 224, 3], tf.float32)]
+    graph = tf.function(model).get_concrete_function(*input_signature)
+    opts = ProfileOptionBuilder.float_operation()
+    opts['output'] = 'none'
+    flops = profile(graph.graph, options=opts).total_float_ops
+    flops_g = flops / 1e9
+    
+    # 计算推理时间（整个测试集）
+    start_time = time.time()
+    model.predict(test_generator, verbose=0)
+    total_inference_time = time.time() - start_time
+    avg_inference_time_per_sample = total_inference_time / len(y_true)
+    
+    # 结果存储
+    results = {
+        'model_name': model_name,
+        'accuracy': f"{accuracy * 100:.2f}%",
+        'precision': f"{precision * 100:.2f}%",
+        'recall': f"{recall * 100:.2f}%",
+        'f1_score': f"{f1 * 100:.2f}%",
+        'flops': f"{flops_g:.2f}G",
+        'params': f"{model.count_params() / 1_000_000:.2f}M",
+        'inference_time': f"{avg_inference_time_per_sample:.4f}s/sample",
+        'total_samples': len(y_true),
+        'total_inference_time': f"{total_inference_time:.2f}s"
+    }
+    
+    print(f"完整测试集评估完成: {len(y_true)} 个样本")
+    print(f"平均推理速度: {len(y_true)/total_inference_time:.1f} samples/s")
+    
+    # 创建结果表格
+    results_df = pd.DataFrame([results])
+    return results_df
+
+# 设置消融实验的模型配置
+def create_ablation_models(input_shape=(224, 224, 3), num_classes=10):
+    models_config = {
+        'EfficientNetB0': create_improved_efficientnet(input_shape=input_shape, num_classes=num_classes,use_dca=False, use_sdc=False, use_can=False) 
+    }
+    return models_config
+
+# 数据预处理
+train_datagen = ImageDataGenerator(rescale=1./255)
+val_datagen = ImageDataGenerator(rescale=1./255)
+test_datagen = ImageDataGenerator(rescale=1./255)
+train_generator = train_datagen.flow_from_directory(train_dir, target_size=input_shape[:2], batch_size=batch_size, class_mode='categorical')
+val_generator = val_datagen.flow_from_directory(val_dir, target_size=input_shape[:2], batch_size=batch_size, class_mode='categorical')
+test_generator = test_datagen.flow_from_directory(test_dir, target_size=input_shape[:2], batch_size=batch_size, class_mode='categorical', shuffle=False)
+
+reduce_lr = callbacks.ReduceLROnPlateau(monitor='val_loss', patience=3, factor=0.4, min_lr=1e-6, verbose=1)
+
+# 获取消融实验的模型配置
+models_config = create_ablation_models(input_shape=input_shape, num_classes=10)
+
+# 训练并评估每个模型
+historis = {}
+results = {}
+for model_name, model in models_config.items():
+    print(f"Training model: {model_name}")
+    model.summary()
+    model.compile(optimizer=tf.keras.optimizers.Adam(), 
+                  loss='categorical_crossentropy', 
+                  metrics=['accuracy'])
+    # 训练模型（使用对应的回调）
+    history = model.fit(train_generator, 
+                        epochs=epochs, 
+                        validation_data=val_generator, 
+                        callbacks=[reduce_lr])
+    # 保存训练历史
+    historis[model_name] = history.history
+    # 进行限时评估
+    print("\n=== 限时评估 (2.5s) ===")
+    limited_df = evaluate_model_limited_time(model, test_generator, model_name, time_limit=2.5)
+    results_limited[model_name] = limited_df
+    
+    # 进行完整评估
+    print("\n=== 完整测试集评估 ===")
+    full_df = evaluate_model_full(model, test_generator, model_name)
+    results_full[model_name] = full_df
+
+# 转换为 DataFrame，并展示
+limited_results_df = pd.concat(results_limited.values(), ignore_index=True)
+full_results_df = pd.concat(results_full.values(), ignore_index=True)
+
+print("\n=== 限时评估结果 ===")
+display(limited_results_df)
+
+print("\n=== 完整评估结果 ===")
+display(full_results_df)
